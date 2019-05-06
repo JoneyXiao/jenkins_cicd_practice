@@ -1,0 +1,102 @@
+node {
+
+	def nexusServer = '192.168.64.31:8081'
+	def nexusRepository = 'test'
+
+	def mvnHome = tool name: 'maven-3.5.0', type: 'maven'
+
+  	def buildNumber
+	def projectName = 'test'
+	def projectNameConfig = 'test'
+	def gitBranch = env.BRANCH_NAME
+	def counterJobName = 'test_BuildCounter'
+
+    def autoDeployOn = []
+
+    def aemArtifactList = [ 
+    	[ name: 'all', path: "${projectNameConfig}.all/target", file: "${projectNameConfig}-all-1.0-SNAPSHOT.zip" ]
+    ]
+
+
+	dir(projectName) {
+		
+		deleteDir()
+
+		stage('Build preparation') {
+			def counterJob = build job: counterJobName , parameters: [string(name: 'PARENT_BRANCH', value: "${projectName}_BuildFlow/${gitBranch}")]
+			buildNumber = counterJob.getNumber().toString()
+		}
+
+		stage('Git checkout') {
+			try {
+				git branch: gitBranch, credentialsId: 'git-credentials', url: 'git@git.com:test/test.git'
+			} catch (error) {
+				build job: 'Service_Set_Status' , parameters: [string(name: 'JOB_NAME', value: "${counterJobName}"), string(name: 'JOB_NUMBER', value: "${buildNumber}")]
+				throw error
+			}
+		}
+
+		stage('Build AEM artifacts') {
+			try {
+					sh "${mvnHome}/bin/mvn clean package"
+			} catch (error) {
+				build job: 'Service_Set_Status' , parameters: [string(name: 'JOB_NAME', value: "${counterJobName}"), string(name: 'JOB_NUMBER', value: "${buildNumber}")]
+				throw error
+			}
+		}
+
+		stage("SonarQube + JaCoCO analyze") {
+			try {
+				step([$class: 'JacocoPublisher', execPattern:'**/**.exec', classPattern: '**/classes', sourcePattern: '**/src/main', exclusionPattern: ''])
+				withSonarQubeEnv('192.168.64.32') {
+					sh "${mvnHome}/bin/mvn clean org.jacoco:jacoco-maven-plugin:prepare-agent install -Dmaven.test.failure.ignore=true"
+					sh "${mvnHome}/bin/mvn sonar:sonar -Dsonar.language=java -Dsonar.branch=JAVACode -Dsonar.projectVersion=${buildNumber}_${gitBranch} -Dsonar.projectName=${projectName}-${gitBranch}-branch"
+                    sh "${mvnHome}/bin/mvn sonar:sonar -Dsonar.language=js -Dsonar.branch=JSCode -Dsonar.projectVersion=${buildNumber}_${gitBranch} -Dsonar.projectName=${projectName}-${gitBranch}-branch"
+				}
+				//timeout(time: 20, unit: 'MINUTES') {
+				//	def sonarGateCheck = waitForQualityGate()
+    			//	if ( sonarGateCheck.status != 'OK' ) {
+    			//		error 'Analyze: SonarQube (Quality Gate check failed)'
+    			//	}
+				//}
+			} catch (error) {
+				build job: 'Service_Set_Status' , parameters: [string(name: 'JOB_NAME', value: "${counterJobName}"), string(name: 'JOB_NUMBER', value: "${buildNumber}")]
+				throw error
+			}
+		}
+		
+		stage("Upload AEM artifacts to Nexus") {
+			try {
+				for ( artifact in aemArtifactList ) {
+					dir(artifact.path) {
+						def artifactName = "${projectNameConfig}-${artifact.name}"
+						//nexusArtifactUploader artifacts: [[artifactId: artifactName, classifier: '', file: artifact.file, type: 'zip']], credentialsId: 'jenkins-on-nexus', groupId: gitBranch, nexusUrl: nexusServer, nexusVersion: 'nexus3', protocol: 'http', repository: nexusRepository, version: buildNumber
+						sh "curl -v -u admin:admin123 --upload-file ${artifact.file} http://${nexusServer}/repository/${nexusRepository}/${gitBranch}/${artifactName}/${buildNumber}/${artifactName}-${buildNumber}.zip"
+						sleep 1
+					}
+				}
+			} catch (error) {
+				build job: 'Service_Set_Status' , parameters: [string(name: 'JOB_NAME', value: "${counterJobName}"), string(name: 'JOB_NUMBER', value: "${buildNumber}")]
+				throw error
+			}
+		}
+
+
+		for ( autoDeploy in autoDeployOn ) {
+			if ( gitBranch == autoDeploy.branch ) {
+				def envList = autoDeploy.environment.split(',')
+				for (int i = 0; i < envList.size(); i++) {
+					def loopItem = envList[i]
+					stage("Automatic deployment on ${loopItem}") {
+						try {
+							build job: 'test_Deploy' , parameters: [string(name: 'test_BuildCounter', value: "nulljob/${counterJobName}/${buildNumber}"), string(name: 'test_environment', value: envList[i])]
+						} catch (error) {
+							build job: 'Service_Set_Status' , parameters: [string(name: 'JOB_NAME', value: "${counterJobName}"), string(name: 'JOB_NUMBER', value: "${buildNumber}")]
+							throw error
+						}
+					}
+				}
+			}
+		}
+	}
+}
