@@ -1,0 +1,238 @@
+import groovy.json.JsonSlurperClassic 
+
+@NonCPS
+def jsonParse(def json) {
+    new groovy.json.JsonSlurperClassic().parseText(json)
+}
+
+//if( 1 == 1 ) {
+//   currentBuild.result = 'SUCCESS'
+//   return
+//}
+
+node {
+
+    deleteDir()
+
+    def nexusServer = '192.168.64.32:8081'
+    def nexusRepository = 'test'
+
+    def ansibleGit = 'git@git.com:test/env.git'
+    def ansibleBranch = 'master'
+
+    def aemDeploymentList = []
+    def deploymentList = []
+
+    def aemPublishersForms = ['192.168.64.50:4503']
+    def aemPublishersCp = ['192.168.64.51:4503']
+
+    def buildNumber
+
+    def aemFormsArtifactList = [ 
+        "common.all-1.0-SNAPSHOT",
+        "forms.all-1.0-SNAPSHOT"
+    ]    
+    
+    def aemCpArtifactList = [ 
+        "common.all-1.0-SNAPSHOT",
+        "cp.all-1.0-SNAPSHOT"
+    ]
+
+    stage('Preparation') {
+        jobInfo = takeJobInfo(source_job - 'nulljob/')
+        buildNumber = source_job.split('/')[-1]
+        gitBranch = jobInfo.actions[0].causes[0].upstreamUrl.split('/')[-1]
+        aemDeploymentList.push('all')
+        deploymentList += aemDeploymentList
+    }
+
+    stage('Downloading artifacts') {
+        for (deploymentItem in deploymentList) {
+            httpRequest url: "http://${nexusServer}/repository/${nexusRepository}/${gitBranch.replaceAll('%252F', '/')}/test-${deploymentItem}/${buildNumber}/test-${deploymentItem}-${buildNumber}.zip", acceptType: 'APPLICATION_ZIP', contentType: 'APPLICATION_ZIP', outputFile: "${deploymentItem}.zip", responseHandle: 'NONE'
+        }
+    }
+
+    stage('Preparation artifacts') {
+        for ( deploymentItem in deploymentList) {
+            sh "unzip -u ${deploymentItem}.zip"
+            sleep time: 5, unit: 'SECONDS'
+            sh "mv jcr_root/etc/packages/test/*.zip ."
+            sleep time: 5, unit: 'SECONDS'
+            sh "rm -rf jcr_root/ META-INF/"
+        }
+    }
+
+    stage('AEM Forms Artifacts deployment') {
+      def aemInstances = aemPublishersForms
+        for ( artifactFormsItem in aemFormsArtifactList ) {
+            def parallelBranches = [:]
+            for ( aemItem in aemInstances ) {
+                def artifactToDeploy = artifactFormsItem
+                def hostToDeploy = aemItem
+                parallelBranches["${artifactToDeploy} on ${hostToDeploy}"] = {
+                    try {
+                        withCredentials([usernamePassword(credentialsId: 'aem-dev-r2', passwordVariable: 'requestPassword', usernameVariable: 'requestUsername')]) {
+                            retry(5) {
+                                def postRequest = sh returnStdout: true, script: "curl -u ${env.requestUsername}:${env.requestPassword} -F file=@\"${artifactToDeploy}.zip\" -F name=${artifactToDeploy} -F force=true -F install=true -F recursive=true http://${hostToDeploy}/crx/packmgr/service.jsp"                            
+                                if ( postRequest.find(/Package installed in [0-9]+ms./) != null  ) {
+                                    println "AEM Package ${artifactToDeploy} installed"
+                                } else {
+                                    println postRequest
+                                    error("${artifactToDeploy} deployment error")
+                                }
+                                sleep time: 35, unit: 'SECONDS'
+                            }
+                        }
+                    } catch (error) {
+                        println "Error during ${artifactToDeploy} on ${hostToDeploy} instance"
+                        throw error
+                    }
+                }
+            }
+            parallel parallelBranches
+        }
+    }
+
+    stage('AEM Cp Artifacts deployment') {
+      def aemInstances = aemPublishersCp
+        for ( artifactCpItem in aemCpArtifactList ) {
+            def parallelBranches = [:]
+            for ( aemItem in aemInstances ) {
+                def artifactToDeploy = artifactCpItem
+                def hostToDeploy = aemItem
+                parallelBranches["${artifactToDeploy} on ${hostToDeploy}"] = {
+                    try {
+                        withCredentials([usernamePassword(credentialsId: 'aem-dev-r2', passwordVariable: 'requestPassword', usernameVariable: 'requestUsername')]) {
+                            retry(5) {
+                                def postRequest = sh returnStdout: true, script: "curl -u ${env.requestUsername}:${env.requestPassword} -F file=@\"${artifactToDeploy}.zip\" -F name=${artifactToDeploy} -F force=true -F install=true -F recursive=true http://${hostToDeploy}/crx/packmgr/service.jsp"                            
+                                if ( postRequest.find(/Package installed in [0-9]+ms./) != null  ) {
+                                    println "AEM Package ${artifactToDeploy} installed"
+                                } else {
+                                    println postRequest
+                                    error("${artifactToDeploy} deployment error")
+                                }
+                                sleep time: 35, unit: 'SECONDS'
+                            }
+                        }
+                    } catch (error) {
+                        println "Error during ${artifactToDeploy} on ${hostToDeploy} instance"
+                        throw error
+                    }
+                }
+            }
+            parallel parallelBranches
+        }
+    }    
+ 
+    stage('Notification') {
+        def counterJobName = 'TEST_CPFW_BuildCounter/'
+
+        def counterJobNumber = source_job.split('/')[-1]
+
+        def jobInfo = findOutBuildNumber(env.JOB_NAME, currentBuild.rawBuild.number, 'source_job')
+        def projectName = jobInfo[0]
+        def endBuild = jobInfo[1]
+        def prevBuildNumber = null
+        def changeSet = []
+        def emailBuild
+        def notificationRecipients = '87732444@qq.com'
+
+        for (buildItem in getBuilds(env.JOB_NAME)) {
+          def buildStatus = hudson.model.Hudson.instance.getItemByFullName(env.JOB_NAME).getBuildByNumber(buildItem.number).result
+          if (buildItem.number != currentBuild.rawBuild.number && buildStatus == hudson.model.Result.'SUCCESS') {
+            def childJobInfo = findOutBuildNumber(env.JOB_NAME, buildItem.number, 'source_job')
+            def projectForBuild = childJobInfo[0]
+            prevBuildNumber = childJobInfo[1]
+            if ( projectForBuild != null && projectForBuild == projectName) {
+              break
+            }
+          }
+        }
+
+        if (prevBuildNumber == endBuild) {
+          println "nothing new"
+          emailBuild = "No changes in current build"
+        } else if ( endBuild < prevBuildNumber) {
+          emailBuild = "Previous build version deployed"
+        } else {
+          for (buildId = prevBuildNumber+1; buildId <= endBuild; buildId++ ) {
+            changeSet.push(getChanges(projectName, buildId))
+          }
+          emailBuild = "<p>Next commits included in this build:</p>"
+          for (changeChildSet in changeSet ) {
+            if (changeChildSet.size() > 0) {
+              for (changeItem in changeChildSet) {
+                for(change in changeItem) {
+                  emailBuild += "<p>${change.comment}</p>"
+
+                }                
+             } 
+            }
+          }
+        }
+
+        def emailSubject = "Deploy job ${env.BUILD_NUMBER} to QA Publishers succeeded -- Build #${endBuild}"
+        def emailBody = "<h1>Dear collegues!</h1><h2>Deploy job ${env.BUILD_NUMBER} to QA Publishers succeeded -- code Build #${endBuild} .</h2>"
+        emailBody += emailBuild
+        try {
+          notifyEmail(notificationRecipients, emailBody, emailSubject, false)
+        } catch(e) {
+            println "catched"
+        }
+    }   
+   
+}
+
+def takeJobInfo(jobName) {
+    dir('temp') {
+        httpRequest acceptType: 'APPLICATION_JSON', outputFile: 'job_file.json', authentication: 'jenkins-on-jenkins', contentType: 'APPLICATION_JSON', url: "${jobName}api/json"
+        def jobInfo = jsonParse(readFile("job_file.json"))
+        deleteDir()
+        return jobInfo
+    }
+}
+
+def notifyEmail(sendTo, body, subject, buildLog) {
+    emailext to: sendTo, subject: subject, body: body, attachLog: true, compressLog: buildLog, mimeType: 'text/html', replyTo: sendTo
+}
+
+
+def findOutBuildNumber (jobName, buildNumber, parameterToSearch) {
+    def project = null
+    def build = null
+    def currentJobParameters = hudson.model.Hudson.instance.getItemByFullName(jobName).getBuildByNumber(buildNumber).getActions(hudson.model.ParametersAction).parameters[0]
+    for ( entry in currentJobParameters ) {
+        if ( entry.name == parameterToSearch ) {
+            def originalBuildInfo = hudson.model.Hudson.instance.getItemByFullName(entry.jobName).getBuildByNumber(entry.number.toInteger())
+            for (entry2 in originalBuildInfo.getCauses()) {
+                if ( entry2.getShortDescription().contains("Started by upstream project") ) {
+                    project = entry2.upstreamProject
+                    build = entry2.upstreamBuild
+                }
+            }
+        }
+    }
+    if ( project != null && build != null ) {
+        return [project, build]
+    } else {
+        return [null, null]
+    }
+    
+}
+
+def getBuilds (jobName) {
+    return hudson.model.Hudson.instance.getItemByFullName(jobName).getBuilds()
+}
+
+def getChanges (jobName, buildNumber) {
+  def resultArray = []
+  def gitChanges = hudson.model.Hudson.instance.getItemByFullName(jobName).getBuildByNumber(buildNumber).changeSets
+  if ( gitChanges[0] != null && gitChanges[0].items != null ) {
+    for (changeItem in gitChanges[0].items) {
+      for (gitChange in changeItem) {
+        resultArray.push(gitChange)
+      }
+    }
+  }
+  return resultArray
+}
