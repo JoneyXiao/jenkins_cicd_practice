@@ -1,0 +1,98 @@
+node {
+    deleteDir()
+    def specificCause = currentBuild.getBuildCauses()[0].shortDescription
+    currentBuild.displayName = "${env.BUILD_ID} #${env.gitlabBranch}"
+    
+    //println "${payload}"
+    
+    def gitRepo = 'git@git.epam.com:hkex-cpfw/hkex-cpfw.git'
+    def modifiedList = []
+    stage('Checkout source code') {
+        git branch: '${env.gitlabBranch}', credentialsId: 'git-credentials', url: gitRepo
+    }
+    stage('Get Modified files') {
+        println 'List of the modified files'
+        def changeLogSets = currentBuild.changeSets
+        for (int i = 0; i < changeLogSets.size(); i++) {
+            def entries = changeLogSets[i].items
+            for (int j = 0; j < entries.length; j++) {
+                def entry = entries[j]
+                def commitLog = "${entry.commitId} by ${entry.author} on ${new Date(entry.timestamp)}: ${entry.msg}"
+                println "commitLog: " + commitLog
+                env.commitLogs += "<p>${commitLog}</p>"
+                def files = new ArrayList(entry.affectedFiles)
+                for (int k = 0; k < files.size(); k++) {
+                    def file = files[k]
+                    //echo "  ${file.editType.name} ${file.path}"
+                    modifiedList.push(file.path)
+                }
+            }
+        }
+    }
+    stage('Run ESlint') {
+        println "gitlabMergeRequestId: ${env.gitlabMergeRequestId}"
+		println "gitlabMergeRequestIid: ${env.gitlabMergeRequestIid}"
+		println "gitlabMergeRequestDescription: ${env.gitlabMergeRequestDescription}"
+		println "gitlabMergeRequestTitle: ${env.gitlabMergeRequestTitle}"
+		println "gitlabUserEmail: ${env.gitlabUserEmail}"
+		println "gitlabMergeRequestAssignee: ${env.gitlabMergeRequestAssignee}"
+        env.lastCommit = "${env.gitlabMergeRequestLastCommit}"
+        println "commitid: " + env.lastCommit
+        env.filesList = sh (
+        returnStdout: true,
+        script: "git diff-tree --no-commit-id --name-only -r ${env.lastCommit} |grep '\\.js\$' |tr '\n' ' '"
+        ).trim()
+		if ( !env.filesList.trim() ) {
+			println "No file to scan !"
+			return
+		}
+		println "JS files list: " + env.filesList
+		env.eslintResult = sh ( 
+		returnStdout: true, script: "eslint ${env.filesList} || true"
+		).trim()
+		if ( env.eslintResult.find(/[0-9]+ problem/) != null ) {
+			currentBuild.result = 'FAILURE'
+		}
+    }
+    // Break pipeline from here if merge request doesn't have js file.
+    if ( !env.filesList.trim() ) {
+        currentBuild.result = 'SUCCESS'
+        println "Bye!"
+        return
+    }
+    stage('Notification') {
+        //println env.filesList
+        //def notificationRecipients = 'Joney_xiao@epam.com;Dexter_Chen@epam.com;Facial_Huo@epam.com;Rahul_Mujnani@epam.com;Steven_Weng@epam.com;Lax_Liu@epam.com;Miranda_Zhong@epam.com;Vincent_Liu@epam.com;Ivan_Fan@epam.com;Rango_Yuan@epam.com;Wen_Wu@epam.com;Uladzislau_Harbachou@epam.com;Yana_Shcherba@epam.com;Viktoryia_Kuzmiankova@epam.com'
+        def notificationRecipients = "Joney_xiao@epam.com;${env.gitlabUserEmail}; ${env.gitlabMergeRequestAssignee}@epam.com"
+        def emailSubject = "${JOB_NAME} - MR(${env.gitlabMergeRequestIid}) - ${currentBuild.displayName} - Status: ${currentBuild.currentResult}"
+        def emailBody = "<h2>Dear colleagues!</h2><h4><a href='${BUILD_URL}'>I am</a> ${specificCause} . <a href='https://git.epam.com/hkex-cpfw/hkex-cpfw/merge_requests/${env.gitlabMergeRequestIid}'>Merge Request Details</a></h4>"
+        //println env.commitLogs
+        //emailBody += "${env.commitLogs}"
+        emailBody += env.eslintResult.replaceAll('\\n','</br>')
+        //println emailBody
+        try {
+            notifyEmail(notificationRecipients, emailBody, emailSubject, false)
+        } catch(e) {
+            println e
+        }
+    }
+}
+
+def getHeads() {
+  return sh(
+    returnStdout: true,
+    script: "git show -s --no-abbrev-commit --pretty=format:%P%n%H%n HEAD"
+  )
+}
+
+def getFirstCommitHash(headsOutput) {
+  return headsOutput.trim().split("\n").first().trim()
+}
+
+def getLastCommitHash(headsOutput) {
+  return headsOutput.trim().split("\n").last().trim()
+}
+
+def notifyEmail(sendTo, body, subject, buildLog) {
+    emailext to: sendTo, subject: subject, body: body, attachLog: false, compressLog: buildLog, mimeType: 'text/html', replyTo: sendTo
+}
